@@ -1089,6 +1089,18 @@ static int gip_handle_pkt_input(struct gip_client *client,
 	return client->drv->ops.input(client, data, len);
 }
 
+static int gip_handle_pkt_input2(struct gip_client *client,
+		struct gip_header *header, void *data, int len)
+{
+	if (len != header->length)
+		return -EINVAL;
+
+	if (!client->drv || !client->drv->ops.input2)
+		return 0;
+
+	return client->drv->ops.input2(client, data, len);
+}
+
 static int gip_handle_pkt_audio_samples(struct gip_client *client,
 					struct gip_header *header,
 					void *data, int len)
