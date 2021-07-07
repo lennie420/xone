@@ -25,6 +25,10 @@ enum gip_wheel_button {
 
 struct gip_wheel_pkt_input {
 	__le16 buttons;
+	__le16 steering;
+	__le16 accelerator;
+	__le16 brake;
+	__le16 clutch;
 } __packed;
 
 struct gip_wheel {
@@ -46,6 +50,10 @@ static int gip_wheel_init_input(struct gip_wheel *wheel)
 	input_set_capability(dev, EV_KEY, BTN_Y);
 	input_set_capability(dev, EV_KEY, BTN_TL);
 	input_set_capability(dev, EV_KEY, BTN_TR);
+	input_set_abs_params(dev, ABS_X, 0, 65535, 16, 128);
+	input_set_abs_params(dev, ABS_Y, 0, 1023, 0, 0);
+	input_set_abs_params(dev, ABS_Z, 0, 1023, 0, 0);
+	input_set_abs_params(dev, ABS_RZ, 0, 1023, 0, 0);
 	input_set_abs_params(dev, ABS_HAT0X, -1, 1, 0, 0);
 	input_set_abs_params(dev, ABS_HAT0Y, -1, 1, 0, 0);
 
@@ -89,6 +97,10 @@ static int gip_wheel_op_input(struct gip_client *client, void *data, int len)
 	input_report_key(dev, BTN_Y, buttons & GIP_WL_BTN_Y);
 	input_report_key(dev, BTN_TL, buttons & GIP_WL_BTN_BUMPER_L);
 	input_report_key(dev, BTN_TR, buttons & GIP_WL_BTN_BUMPER_R);
+	input_report_abs(dev, ABS_X, le16_to_cpu(pkt->steering));
+	input_report_abs(dev, ABS_Y, le16_to_cpu(pkt->accelerator));
+	input_report_abs(dev, ABS_Z, le16_to_cpu(pkt->brake));
+	input_report_abs(dev, ABS_RZ, le16_to_cpu(pkt->clutch));
 	input_report_abs(dev, ABS_HAT0X,
 			!!(buttons & GIP_WL_BTN_DPAD_R) - !!(buttons & GIP_WL_BTN_DPAD_L));
 	input_report_abs(dev, ABS_HAT0Y,
