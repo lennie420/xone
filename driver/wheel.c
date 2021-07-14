@@ -84,7 +84,7 @@ static int gip_wheel_op_input(struct gip_client *client, void *data, int len)
 	u16 buttons = le16_to_cpu(pkt->buttons);
 
 	if (len < sizeof(*pkt))
-		return 0;
+		return -EINVAL;
 
 	print_hex_dump_debug("wheel input: ", DUMP_PREFIX_NONE, 16, 1,
 				data, len, false);
