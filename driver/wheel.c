@@ -110,14 +110,6 @@ static int gip_wheel_op_input(struct gip_client *client, void *data, int len)
 	return 0;
 }
 
-static int gip_wheel_op_input2(struct gip_client *client, void *data, int len)
-{
-	print_hex_dump_debug("wheel input2: ", DUMP_PREFIX_NONE, 16, 1,
-				data, len, false);
-
-	return 0;
-}
-
 static int gip_wheel_probe(struct gip_client *client)
 {
 	struct gip_wheel *wheel;
@@ -178,7 +170,6 @@ static struct gip_driver gip_wheel_driver = {
 	.ops = {
 		.guide_button = gip_wheel_op_guide_button,
 		.input = gip_wheel_op_input,
-		.input2 = gip_wheel_op_input2,
 	},
 	.probe = gip_wheel_probe,
 	.remove = gip_wheel_remove,
