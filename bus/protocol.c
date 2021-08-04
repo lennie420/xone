@@ -601,7 +601,7 @@ static struct gip_info_element *gip_parse_info_element(u8 *data, int len,
 	if (len < off + total)
 		return ERR_PTR(-EINVAL);
 
-	elem = kzalloc(sizeof(*elem) + total, GFP_ATOMIC);
+	elem = kzalloc(struct_size(elem, data, total), GFP_ATOMIC);
 	if (!elem)
 		return ERR_PTR(-ENOMEM);
 
@@ -717,8 +717,7 @@ static int gip_parse_classes(struct gip_client *client,
 	if (!count)
 		return -EINVAL;
 
-	classes = kzalloc(sizeof(*classes) + sizeof(char *) * count,
-			  GFP_ATOMIC);
+	classes = kzalloc(struct_size(classes, strings, count), GFP_ATOMIC);
 	if (!classes)
 		return -ENOMEM;
 
@@ -1198,7 +1197,7 @@ static int gip_init_chunk_buffer(struct gip_client *client, int len)
 		kfree(buf);
 	}
 
-	buf = kzalloc(sizeof(*buf) + len, GFP_ATOMIC);
+	buf = kzalloc(struct_size(buf, data, len), GFP_ATOMIC);
 	if (!buf)
 		return -ENOMEM;
 
