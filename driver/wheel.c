@@ -60,7 +60,7 @@ static int gip_wheel_init_input(struct gip_wheel *wheel)
 	err = input_register_device(dev);
 	if (err)
 		dev_err(&client->dev, "%s: register failed: %d\n",
-				__func__, err);
+			__func__, err);
 
 	return err;
 }
@@ -87,7 +87,7 @@ static int gip_wheel_op_input(struct gip_client *client, void *data, int len)
 		return -EINVAL;
 
 	print_hex_dump_debug("wheel input: ", DUMP_PREFIX_NONE, 16, 1,
-				data, len, false);
+			     data, len, false);
 
 	input_report_key(dev, BTN_START, buttons & GIP_WL_BTN_MENU);
 	input_report_key(dev, BTN_SELECT, buttons & GIP_WL_BTN_VIEW);
@@ -101,10 +101,10 @@ static int gip_wheel_op_input(struct gip_client *client, void *data, int len)
 	input_report_abs(dev, ABS_Y, le16_to_cpu(pkt->accelerator));
 	input_report_abs(dev, ABS_Z, le16_to_cpu(pkt->brake));
 	input_report_abs(dev, ABS_RZ, le16_to_cpu(pkt->clutch));
-	input_report_abs(dev, ABS_HAT0X,
-			!!(buttons & GIP_WL_BTN_DPAD_R) - !!(buttons & GIP_WL_BTN_DPAD_L));
-	input_report_abs(dev, ABS_HAT0Y,
-			!!(buttons & GIP_WL_BTN_DPAD_D) - !!(buttons & GIP_WL_BTN_DPAD_U));
+	input_report_abs(dev, ABS_HAT0X, !!(buttons & GIP_WL_BTN_DPAD_R) -
+					 !!(buttons & GIP_WL_BTN_DPAD_L));
+	input_report_abs(dev, ABS_HAT0Y, !!(buttons & GIP_WL_BTN_DPAD_D) -
+					 !!(buttons & GIP_WL_BTN_DPAD_U));
 	input_sync(dev);
 
 	return 0;
@@ -159,7 +159,7 @@ static int gip_wheel_suspend(struct gip_client *client)
 	err = gip_set_power_mode(client, GIP_PWR_OFF);
 	if (err)
 		dev_err(&client->dev, "%s: set power mode failed: %d\n",
-				__func__, err);
+			__func__, err);
 
 	return err;
 }
