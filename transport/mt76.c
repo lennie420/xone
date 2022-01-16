@@ -39,6 +39,16 @@ enum xone_mt76_ms_command {
 	XONE_MT_SET_CHAN_CANDIDATES = 0x07,
 };
 
+enum xone_mt76_wow_feature {
+	XONE_MT_WOW_ENABLE = 0x01,
+	XONE_MT_WOW_TRAFFIC = 0x03,
+};
+
+enum xone_mt76_wow_traffic {
+	XONE_MT_WOW_TO_FIRMWARE = 0x00,
+	XONE_MT_WOW_TO_HOST = 0x01,
+};
+
 struct xone_mt76_msg_load_cr {
 	u8 mode;
 	u8 temperature;
@@ -328,6 +338,36 @@ static int xone_mt76_set_power_mode(struct xone_mt76 *mt,
 	put_unaligned_le32(mode, skb_put(skb, sizeof(u32)));
 
 	return xone_mt76_send_command(mt, skb, MT_CMD_POWER_SAVING_OP);
+}
+
+static int xone_mt76_set_wow_enable(struct xone_mt76 *mt, bool enable)
+{
+	struct sk_buff *skb;
+
+	skb = xone_mt76_alloc_message(sizeof(u32) + sizeof(u8) * 2, GFP_KERNEL);
+	if (!skb)
+		return -ENOMEM;
+
+	put_unaligned_le32(XONE_MT_WOW_ENABLE, skb_put(skb, sizeof(u32)));
+	skb_put_u8(skb, enable);
+	skb_put_u8(skb, mt->channel->index);
+
+	return xone_mt76_send_command(mt, skb, MT_CMD_WOW_FEATURE);
+}
+
+static int xone_mt76_set_wow_traffic(struct xone_mt76 *mt,
+				     enum xone_mt76_wow_traffic traffic)
+{
+	struct sk_buff *skb;
+
+	skb = xone_mt76_alloc_message(sizeof(u32) + sizeof(u8), GFP_KERNEL);
+	if (!skb)
+		return -ENOMEM;
+
+	put_unaligned_le32(XONE_MT_WOW_TRAFFIC, skb_put(skb, sizeof(u32)));
+	skb_put_u8(skb, traffic);
+
+	return xone_mt76_send_command(mt, skb, MT_CMD_WOW_FEATURE);
 }
 
 static int xone_mt76_switch_channel(struct xone_mt76 *mt,
@@ -855,7 +895,7 @@ static u16 xone_mt76_get_chip_id(struct xone_mt76 *mt)
 	return (id[1] << 8) | id[2];
 }
 
-int xone_mt76_init_chip(struct xone_mt76 *mt)
+int xone_mt76_init_radio(struct xone_mt76 *mt)
 {
 	int err;
 
@@ -899,6 +939,48 @@ int xone_mt76_init_chip(struct xone_mt76 *mt)
 	msleep(1000);
 
 	return xone_mt76_set_pairing(mt, false);
+}
+
+int xone_mt76_suspend_radio(struct xone_mt76 *mt)
+{
+	int err;
+
+	xone_mt76_write_register(mt, MT_MAC_SYS_CTRL, 0);
+
+	/* enable wake-on-wireless */
+	err = xone_mt76_set_wow_enable(mt, true);
+	if (err)
+		return err;
+
+	return xone_mt76_set_wow_traffic(mt, XONE_MT_WOW_TO_HOST);
+}
+
+int xone_mt76_resume_radio(struct xone_mt76 *mt)
+{
+	int err;
+
+	err = xone_mt76_set_wow_traffic(mt, XONE_MT_WOW_TO_FIRMWARE);
+	if (err)
+		return err;
+
+	/* disable wake-on-wireless */
+	err = xone_mt76_set_wow_enable(mt, false);
+	if (err)
+		return err;
+
+	err = xone_mt76_switch_channel(mt, mt->channel);
+	if (err)
+		return err;
+
+	err = xone_mt76_set_pairing(mt, false);
+	if (err)
+		return err;
+
+	xone_mt76_write_register(mt, MT_MAC_SYS_CTRL,
+				 MT_MAC_SYS_CTRL_ENABLE_RX |
+				 MT_MAC_SYS_CTRL_ENABLE_TX);
+
+	return 0;
 }
 
 static int xone_mt76_write_beacon(struct xone_mt76 *mt, bool pair)

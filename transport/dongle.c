@@ -22,6 +22,8 @@
 
 #define XONE_DONGLE_MAX_CLIENTS 16
 
+#define XONE_DONGLE_PWR_OFF_TIMEOUT msecs_to_jiffies(5000)
+
 struct xone_dongle_skb_cb {
 	struct xone_dongle *dongle;
 	struct urb *urb;
@@ -65,6 +67,8 @@ struct xone_dongle {
 	/* serializes access to clients array */
 	spinlock_t clients_lock;
 	struct xone_dongle_client *clients[XONE_DONGLE_MAX_CLIENTS];
+	atomic_t client_count;
+	wait_queue_head_t disconnect_wait;
 
 	struct workqueue_struct *event_wq;
 };
@@ -298,6 +302,8 @@ static int xone_dongle_add_client(struct xone_dongle *dongle, u8 *addr)
 	dongle->clients[client->wcid - 1] = client;
 	spin_unlock_irqrestore(&dongle->clients_lock, flags);
 
+	atomic_inc(&dongle->client_count);
+
 	return 0;
 
 err_free_client:
@@ -310,7 +316,7 @@ err_free_client:
 static int xone_dongle_remove_client(struct xone_dongle *dongle, u8 wcid)
 {
 	struct xone_dongle_client *client;
-	int i, err;
+	int err;
 	unsigned long flags;
 
 	client = dongle->clients[wcid - 1];
@@ -329,14 +335,17 @@ static int xone_dongle_remove_client(struct xone_dongle *dongle, u8 wcid)
 
 	err = xone_mt76_remove_client(&dongle->mt, wcid);
 	if (err)
-		return err;
-
-	for (i = 0; i < XONE_DONGLE_MAX_CLIENTS; i++)
-		if (dongle->clients[i])
-			return 0;
+		dev_err(dongle->mt.dev, "%s: remove failed: %d\n",
+			__func__, err);
 
 	/* turn off LED if all clients have disconnected */
-	return xone_mt76_set_led_mode(&dongle->mt, XONE_MT_LED_OFF);
+	if (atomic_read(&dongle->client_count) == 1)
+		err = xone_mt76_set_led_mode(&dongle->mt, XONE_MT_LED_OFF);
+
+	atomic_dec(&dongle->client_count);
+	wake_up(&dongle->disconnect_wait);
+
+	return err;
 }
 
 static int xone_dongle_pair_client(struct xone_dongle *dongle, u8 *addr)
@@ -757,11 +766,44 @@ static int xone_dongle_init(struct xone_dongle *dongle)
 		return err;
 	}
 
-	err = xone_mt76_init_chip(mt);
+	err = xone_mt76_init_radio(mt);
 	if (err)
-		dev_err(mt->dev, "%s: init chip failed: %d\n", __func__, err);
+		dev_err(mt->dev, "%s: init radio failed: %d\n", __func__, err);
 
 	return err;
+}
+
+static int xone_dongle_power_off_clients(struct xone_dongle *dongle)
+{
+	struct xone_dongle_client *client;
+	int i;
+	int err = 0;
+	unsigned long flags;
+
+	spin_lock_irqsave(&dongle->clients_lock, flags);
+
+	for (i = 0; i < XONE_DONGLE_MAX_CLIENTS; i++) {
+		client = dongle->clients[i];
+		if (!client)
+			continue;
+
+		err = gip_power_off_adapter(client->adapter);
+		if (err)
+			break;
+	}
+
+	spin_unlock_irqrestore(&dongle->clients_lock, flags);
+
+	if (err)
+		return err;
+
+	/* can time out if new client connects */
+	if (!wait_event_timeout(dongle->disconnect_wait,
+				!atomic_read(&dongle->client_count),
+				XONE_DONGLE_PWR_OFF_TIMEOUT))
+		return -ETIMEDOUT;
+
+	return 0;
 }
 
 static void xone_dongle_destroy(struct xone_dongle *dongle)
@@ -793,6 +835,8 @@ static void xone_dongle_destroy(struct xone_dongle *dongle)
 				  urb->transfer_buffer, urb->transfer_dma);
 		usb_free_urb(urb);
 	}
+
+	mutex_destroy(&dongle->pairing_lock);
 }
 
 static int xone_dongle_probe(struct usb_interface *intf,
@@ -810,12 +854,16 @@ static int xone_dongle_probe(struct usb_interface *intf,
 
 	usb_reset_device(dongle->mt.udev);
 
+	/* enable USB remote wakeup feature */
+	device_wakeup_enable(&dongle->mt.udev->dev);
+
 	dongle->event_wq = alloc_ordered_workqueue("xone_dongle", 0);
 	if (!dongle->event_wq)
 		return -ENOMEM;
 
 	mutex_init(&dongle->pairing_lock);
 	spin_lock_init(&dongle->clients_lock);
+	init_waitqueue_head(&dongle->disconnect_wait);
 
 	err = xone_dongle_init(dongle);
 	if (err) {
@@ -831,9 +879,63 @@ static int xone_dongle_probe(struct usb_interface *intf,
 static void xone_dongle_disconnect(struct usb_interface *intf)
 {
 	struct xone_dongle *dongle = usb_get_intfdata(intf);
+	int err;
+
+	/* can fail during USB device removal */
+	err = xone_dongle_power_off_clients(dongle);
+	if (err)
+		dev_dbg(dongle->mt.dev, "%s: power off failed: %d\n",
+			__func__, err);
 
 	xone_dongle_destroy(dongle);
 	usb_set_intfdata(intf, NULL);
+}
+
+static int xone_dongle_suspend(struct usb_interface *intf, pm_message_t message)
+{
+	struct xone_dongle *dongle = usb_get_intfdata(intf);
+	int err;
+
+	err = xone_dongle_power_off_clients(dongle);
+	if (err)
+		dev_err(dongle->mt.dev, "%s: power off failed: %d\n",
+			__func__, err);
+
+	usb_kill_anchored_urbs(&dongle->urbs_in_busy);
+	usb_kill_anchored_urbs(&dongle->urbs_out_busy);
+	flush_workqueue(dongle->event_wq);
+
+	return xone_mt76_suspend_radio(&dongle->mt);
+}
+
+static int xone_dongle_resume(struct usb_interface *intf)
+{
+	struct xone_dongle *dongle = usb_get_intfdata(intf);
+	struct urb *urb;
+	int err;
+
+	while ((urb = usb_get_from_anchor(&dongle->urbs_in_idle))) {
+		usb_anchor_urb(urb, &dongle->urbs_in_busy);
+		usb_free_urb(urb);
+
+		err = usb_submit_urb(urb, GFP_KERNEL);
+		if (err)
+			return err;
+	}
+
+	return xone_mt76_resume_radio(&dongle->mt);
+}
+
+static void xone_dongle_shutdown(struct device *dev)
+{
+	struct usb_interface *intf = to_usb_interface(dev);
+	struct xone_dongle *dongle = usb_get_intfdata(intf);
+	int err;
+
+	err = xone_dongle_power_off_clients(dongle);
+	if (err)
+		dev_err(dongle->mt.dev, "%s: power off failed: %d\n",
+			__func__, err);
 }
 
 static const struct usb_device_id xone_dongle_id_table[] = {
@@ -848,8 +950,13 @@ static struct usb_driver xone_dongle_driver = {
 	.name = "xone-dongle",
 	.probe = xone_dongle_probe,
 	.disconnect = xone_dongle_disconnect,
+	.suspend = xone_dongle_suspend,
+	.resume = xone_dongle_resume,
 	.id_table = xone_dongle_id_table,
 	.dev_groups = xone_dongle_groups,
+	.drvwrap.driver.shutdown = xone_dongle_shutdown,
+	.soft_unbind = 1,
+	.disable_hub_initiated_lpm = 1,
 };
 
 module_usb_driver(xone_dongle_driver);
