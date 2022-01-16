@@ -25,16 +25,18 @@ If you are running `xow` upgrading to `xone` is *highly recommended*!
     - [x] Xbox One Controllers
     - [x] Xbox Series X|S Controllers
     - [x] Third party controllers (PowerA, PDP, etc.)
-- [x] Headsets
+- [ ] Headsets
     - [x] Xbox One Chat Headset
     - [x] Xbox One Stereo Headset (adapter or jack)
-    - [x] Xbox Wireless Headset
-    - [x] Third party wireless headsets (SteelSeries, Razer, etc.)
+    - [ ] Xbox Wireless Headset
+    - [ ] Third party wireless headsets (SteelSeries, Razer, etc.)
 - [ ] Racing wheels
 - [x] Xbox One Chatpad
 - [x] Xbox Adaptive Controller
 - [ ] Mad Catz Rock Band 4 Wireless Stratocaster
 - [ ] Mad Catz Rock Band 4 Wireless Drum Kit
+
+⚠️ Standalone wireless headsets are currently not supported!
 
 ## Releases
 
