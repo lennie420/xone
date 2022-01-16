@@ -35,15 +35,26 @@ struct xone_dongle_client {
 	struct gip_adapter *adapter;
 };
 
+struct xone_dongle_event {
+	enum xone_dongle_event_type {
+		XONE_DONGLE_EVT_ADD_CLIENT,
+		XONE_DONGLE_EVT_REMOVE_CLIENT,
+		XONE_DONGLE_EVT_PAIR_CLIENT,
+		XONE_DONGLE_EVT_TOGGLE_PAIRING,
+	} type;
+
+	struct xone_dongle *dongle;
+	u8 address[ETH_ALEN];
+	u8 wcid;
+
+	struct work_struct work;
+};
+
 struct xone_dongle {
 	struct xone_mt76 mt;
 
 	struct usb_anchor urbs_in_idle;
 	struct usb_anchor urbs_in_busy;
-	struct workqueue_struct *message_wq;
-	struct work_struct message_work;
-	struct sk_buff_head message_queue;
-
 	struct usb_anchor urbs_out_idle;
 	struct usb_anchor urbs_out_busy;
 
@@ -51,7 +62,11 @@ struct xone_dongle {
 	struct mutex pairing_lock;
 	bool pairing;
 
+	/* serializes access to clients array */
+	spinlock_t clients_lock;
 	struct xone_dongle_client *clients[XONE_DONGLE_MAX_CLIENTS];
+
+	struct workqueue_struct *event_wq;
 };
 
 static void xone_dongle_prep_packet(struct xone_dongle_client *client,
@@ -258,25 +273,11 @@ xone_dongle_create_client(struct xone_dongle *dongle, u8 *addr)
 	return client;
 }
 
-static int xone_dongle_handle_qos_data(struct xone_dongle *dongle,
-				       struct sk_buff *skb, u8 wcid)
-{
-	struct xone_dongle_client *client;
-
-	if (!wcid || wcid > XONE_DONGLE_MAX_CLIENTS)
-		return 0;
-
-	client = dongle->clients[wcid - 1];
-	if (!client)
-		return 0;
-
-	return gip_process_buffer(client->adapter, skb->data, skb->len);
-}
-
-static int xone_dongle_handle_association(struct xone_dongle *dongle, u8 *addr)
+static int xone_dongle_add_client(struct xone_dongle *dongle, u8 *addr)
 {
 	struct xone_dongle_client *client;
 	int err;
+	unsigned long flags;
 
 	client = xone_dongle_create_client(dongle, addr);
 	if (IS_ERR(client))
@@ -292,7 +293,10 @@ static int xone_dongle_handle_association(struct xone_dongle *dongle, u8 *addr)
 
 	dev_dbg(dongle->mt.dev, "%s: wcid=%d, address=%pM\n",
 		__func__, client->wcid, addr);
+
+	spin_lock_irqsave(&dongle->clients_lock, flags);
 	dongle->clients[client->wcid - 1] = client;
+	spin_unlock_irqrestore(&dongle->clients_lock, flags);
 
 	return 0;
 
@@ -303,14 +307,11 @@ err_free_client:
 	return err;
 }
 
-static int xone_dongle_handle_disassociation(struct xone_dongle *dongle,
-					     u8 wcid)
+static int xone_dongle_remove_client(struct xone_dongle *dongle, u8 wcid)
 {
 	struct xone_dongle_client *client;
 	int i, err;
-
-	if (!wcid || wcid > XONE_DONGLE_MAX_CLIENTS)
-		return 0;
+	unsigned long flags;
 
 	client = dongle->clients[wcid - 1];
 	if (!client)
@@ -318,9 +319,13 @@ static int xone_dongle_handle_disassociation(struct xone_dongle *dongle,
 
 	dev_dbg(dongle->mt.dev, "%s: wcid=%d, address=%pM\n",
 		__func__, wcid, client->address);
+
+	spin_lock_irqsave(&dongle->clients_lock, flags);
+	dongle->clients[wcid - 1] = NULL;
+	spin_unlock_irqrestore(&dongle->clients_lock, flags);
+
 	gip_destroy_adapter(client->adapter);
 	kfree(client);
-	dongle->clients[wcid - 1] = NULL;
 
 	err = xone_mt76_remove_client(&dongle->mt, wcid);
 	if (err)
@@ -334,16 +339,9 @@ static int xone_dongle_handle_disassociation(struct xone_dongle *dongle,
 	return xone_mt76_set_led_mode(&dongle->mt, XONE_MT_LED_OFF);
 }
 
-static int xone_dongle_handle_reserved(struct xone_dongle *dongle,
-				       struct sk_buff *skb, u8 *addr)
+static int xone_dongle_pair_client(struct xone_dongle *dongle, u8 *addr)
 {
 	int err;
-
-	if (skb->len < 2)
-		return -EINVAL;
-
-	if (skb->data[1] != 0x01)
-		return 0;
 
 	dev_dbg(dongle->mt.dev, "%s: address=%pM\n", __func__, addr);
 
@@ -352,6 +350,140 @@ static int xone_dongle_handle_reserved(struct xone_dongle *dongle,
 		return err;
 
 	return xone_dongle_toggle_pairing(dongle, false);
+}
+
+static void xone_dongle_handle_event(struct work_struct *work)
+{
+	struct xone_dongle_event *evt = container_of(work, typeof(*evt), work);
+	int err;
+
+	switch (evt->type) {
+	case XONE_DONGLE_EVT_ADD_CLIENT:
+		err = xone_dongle_add_client(evt->dongle, evt->address);
+		break;
+	case XONE_DONGLE_EVT_REMOVE_CLIENT:
+		err = xone_dongle_remove_client(evt->dongle, evt->wcid);
+		break;
+	case XONE_DONGLE_EVT_PAIR_CLIENT:
+		err = xone_dongle_pair_client(evt->dongle, evt->address);
+		break;
+	case XONE_DONGLE_EVT_TOGGLE_PAIRING:
+		err = xone_dongle_toggle_pairing(evt->dongle, true);
+		break;
+	}
+
+	if (err)
+		dev_err(evt->dongle->mt.dev, "%s: handle event failed: %d\n",
+			__func__, err);
+
+	kfree(evt);
+}
+
+static struct xone_dongle_event *
+xone_dongle_alloc_event(struct xone_dongle *dongle,
+			enum xone_dongle_event_type type)
+{
+	struct xone_dongle_event *evt;
+
+	evt = kzalloc(sizeof(*evt), GFP_ATOMIC);
+	if (!evt)
+		return NULL;
+
+	evt->type = type;
+	evt->dongle = dongle;
+	INIT_WORK(&evt->work, xone_dongle_handle_event);
+
+	return evt;
+}
+
+static int xone_dongle_handle_qos_data(struct xone_dongle *dongle,
+				       struct sk_buff *skb, u8 wcid)
+{
+	struct xone_dongle_client *client;
+	int err = 0;
+	unsigned long flags;
+
+	if (!wcid || wcid > XONE_DONGLE_MAX_CLIENTS)
+		return 0;
+
+	spin_lock_irqsave(&dongle->clients_lock, flags);
+
+	client = dongle->clients[wcid - 1];
+	if (client)
+		err = gip_process_buffer(client->adapter, skb->data, skb->len);
+
+	spin_unlock_irqrestore(&dongle->clients_lock, flags);
+
+	return err;
+}
+
+static int xone_dongle_handle_association(struct xone_dongle *dongle, u8 *addr)
+{
+	struct xone_dongle_event *evt;
+
+	evt = xone_dongle_alloc_event(dongle, XONE_DONGLE_EVT_ADD_CLIENT);
+	if (!evt)
+		return -ENOMEM;
+
+	memcpy(evt->address, addr, ETH_ALEN);
+
+	queue_work(dongle->event_wq, &evt->work);
+
+	return 0;
+}
+
+static int xone_dongle_handle_disassociation(struct xone_dongle *dongle,
+					     u8 wcid)
+{
+	struct xone_dongle_event *evt;
+
+	if (!wcid || wcid > XONE_DONGLE_MAX_CLIENTS)
+		return 0;
+
+	evt = xone_dongle_alloc_event(dongle, XONE_DONGLE_EVT_REMOVE_CLIENT);
+	if (!evt)
+		return -ENOMEM;
+
+	evt->wcid = wcid;
+
+	queue_work(dongle->event_wq, &evt->work);
+
+	return 0;
+}
+
+static int xone_dongle_handle_reserved(struct xone_dongle *dongle,
+				       struct sk_buff *skb, u8 *addr)
+{
+	struct xone_dongle_event *evt;
+
+	if (skb->len < 2)
+		return -EINVAL;
+
+	if (skb->data[1] != 0x01)
+		return 0;
+
+	evt = xone_dongle_alloc_event(dongle, XONE_DONGLE_EVT_PAIR_CLIENT);
+	if (!evt)
+		return -ENOMEM;
+
+	memcpy(evt->address, addr, ETH_ALEN);
+
+	queue_work(dongle->event_wq, &evt->work);
+
+	return 0;
+}
+
+static int xone_dongle_handle_button(struct xone_dongle *dongle)
+{
+	struct xone_dongle_event *evt;
+
+	evt = xone_dongle_alloc_event(dongle, XONE_DONGLE_EVT_TOGGLE_PAIRING);
+	if (!evt)
+		return -ENOMEM;
+
+	queue_work(dongle->event_wq, &evt->work);
+
+	return 0;
 }
 
 static int xone_dongle_handle_loss(struct xone_dongle *dongle,
@@ -457,7 +589,7 @@ static int xone_dongle_process_message(struct xone_dongle *dongle,
 
 	switch (FIELD_GET(MT_RX_FCE_INFO_EVT_TYPE, info)) {
 	case XONE_MT_EVT_BUTTON:
-		return xone_dongle_toggle_pairing(dongle, true);
+		return xone_dongle_handle_button(dongle);
 	case XONE_MT_EVT_PACKET_RX:
 		return xone_dongle_process_wlan(dongle, skb);
 	case XONE_MT_EVT_CLIENT_LOST:
@@ -467,28 +599,37 @@ static int xone_dongle_process_message(struct xone_dongle *dongle,
 	return 0;
 }
 
-static void xone_dongle_process_queue(struct work_struct *work)
+static int xone_dongle_process_buffer(struct xone_dongle *dongle,
+				      void *data, int len)
 {
-	struct xone_dongle *dongle = container_of(work, typeof(*dongle),
-						  message_work);
 	struct sk_buff *skb;
 	int err;
 
-	while ((skb = skb_dequeue(&dongle->message_queue))) {
-		err = xone_dongle_process_message(dongle, skb);
-		if (err)
-			dev_err(dongle->mt.dev,
-				"%s: process message failed: %d\n",
-				__func__, err);
+	if (!len)
+		return 0;
 
-		dev_kfree_skb(skb);
+	skb = dev_alloc_skb(len);
+	if (!skb)
+		return -ENOMEM;
+
+	skb_put_data(skb, data, len);
+
+	err = xone_dongle_process_message(dongle, skb);
+	if (err) {
+		dev_err(dongle->mt.dev, "%s: process failed: %d\n",
+			__func__, err);
+		print_hex_dump_debug("xone-dongle packet: ", DUMP_PREFIX_NONE,
+				     16, 1, data, len, false);
 	}
+
+	dev_kfree_skb(skb);
+
+	return err;
 }
 
 static void xone_dongle_complete_in(struct urb *urb)
 {
 	struct xone_dongle *dongle = urb->context;
-	struct sk_buff *skb;
 	int err;
 
 	switch (urb->status) {
@@ -503,16 +644,11 @@ static void xone_dongle_complete_in(struct urb *urb)
 		goto resubmit;
 	}
 
-	if (!urb->actual_length)
-		goto resubmit;
-
-	skb = dev_alloc_skb(urb->actual_length);
-	if (!skb)
-		goto resubmit;
-
-	skb_put_data(skb, urb->transfer_buffer, urb->actual_length);
-	skb_queue_tail(&dongle->message_queue, skb);
-	queue_work(dongle->message_wq, &dongle->message_work);
+	err = xone_dongle_process_buffer(dongle, urb->transfer_buffer,
+					 urb->actual_length);
+	if (err)
+		dev_err(dongle->mt.dev, "%s: process failed: %d\n",
+			__func__, err);
 
 resubmit:
 	/* can fail during USB device removal */
@@ -635,8 +771,7 @@ static void xone_dongle_destroy(struct xone_dongle *dongle)
 	int i;
 
 	usb_kill_anchored_urbs(&dongle->urbs_in_busy);
-	destroy_workqueue(dongle->message_wq);
-	skb_queue_purge(&dongle->message_queue);
+	destroy_workqueue(dongle->event_wq);
 
 	for (i = 0; i < XONE_DONGLE_MAX_CLIENTS; i++) {
 		client = dongle->clients[i];
@@ -675,16 +810,12 @@ static int xone_dongle_probe(struct usb_interface *intf,
 
 	usb_reset_device(dongle->mt.udev);
 
-	dongle->message_wq = alloc_workqueue("xone_dongle",
-					     WQ_UNBOUND |
-					     WQ_MEM_RECLAIM |
-					     WQ_HIGHPRI, 0);
-	if (!dongle->message_wq)
+	dongle->event_wq = alloc_ordered_workqueue("xone_dongle", 0);
+	if (!dongle->event_wq)
 		return -ENOMEM;
 
-	INIT_WORK(&dongle->message_work, xone_dongle_process_queue);
-	skb_queue_head_init(&dongle->message_queue);
 	mutex_init(&dongle->pairing_lock);
+	spin_lock_init(&dongle->clients_lock);
 
 	err = xone_dongle_init(dongle);
 	if (err) {
